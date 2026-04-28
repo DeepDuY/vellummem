@@ -53,6 +53,68 @@ class VellumDB:
         conn = self.connect()
         conn.executescript(sql)
         conn.commit()
+        self._migrate_config()
+        self._seed_defaults()
+
+    def _migrate_config(self):
+        """Upgrade config table from old 2-column to new 6-column schema."""
+        conn = self.connect()
+        cols = [r["name"] for r in conn.execute(
+            "PRAGMA table_info(config)"
+        ).fetchall()]
+        required = {"key", "value", "type", "description", "created_at", "updated_at"}
+        if set(cols) == required:
+            return
+        # Save old data before dropping
+        old_data = dict(
+            conn.execute("SELECT key, value FROM config").fetchall()
+        )
+        conn.execute("DROP TABLE config")
+        conn.execute("""
+            CREATE TABLE config (
+                key         TEXT PRIMARY KEY,
+                value       TEXT NOT NULL DEFAULT '',
+                type        TEXT NOT NULL DEFAULT 'str',
+                description TEXT DEFAULT '',
+                created_at  TEXT DEFAULT (datetime('now','localtime')),
+                updated_at  TEXT DEFAULT (datetime('now','localtime'))
+            )
+        """)
+        # Restore old data with new schema defaults
+        for k, v in old_data.items():
+            conn.execute(
+                "INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)",
+                (k, v)
+            )
+        # Seed standard defaults (INSERT OR IGNORE so old values survive)
+        defaults = [
+            ("mode",          "human",        "str",   "当前检索模式: human / code"),
+            ("project_id",    "",             "str",   "当前绑定的项目 ID"),
+            ("project_path",  "",             "str",   "当前绑定的项目路径"),
+            ("vector_engine", "transformer",  "str",   "向量引擎"),
+            ("score_threshold", "0.15",       "float", "向量检索最低匹配分数"),
+        ]
+        conn.executemany(
+            "INSERT OR IGNORE INTO config (key, value, type, description) VALUES (?, ?, ?, ?)",
+            defaults
+        )
+        conn.commit()
+
+    def _seed_defaults(self):
+        """Ensure required config keys exist (no-op if already present)."""
+        conn = self.connect()
+        defaults = [
+            ("mode",          "human",        "str",   "当前检索模式: human / code"),
+            ("project_id",    "",             "str",   "当前绑定的项目 ID"),
+            ("project_path",  "",             "str",   "当前绑定的项目路径"),
+            ("vector_engine", "transformer",  "str",   "向量引擎"),
+            ("score_threshold", "0.15",       "float", "向量检索最低匹配分数"),
+        ]
+        conn.executemany(
+            "INSERT OR IGNORE INTO config (key, value, type, description) VALUES (?, ?, ?, ?)",
+            defaults
+        )
+        conn.commit()
 
     def is_initialized(self) -> bool:
         """Check if the database has been initialized."""
@@ -73,8 +135,8 @@ class VellumDB:
     def stats(self) -> dict:
         """Return row counts for all main tables."""
         tables = [
-            "timeline", "semantic_entities", "semantic_facts",
-            "patterns", "reflections", "projects",
-            "file_map", "decisions", "tasks", "decision_hub",
+            "human_timeline", "conversation_context",
+            "projects", "file_map", "decisions", "tasks",
+            "config",
         ]
         return {t: self.table_count(t) for t in tables}
