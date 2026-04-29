@@ -5,14 +5,7 @@ import sqlite3
 
 
 class VellumDB:
-    """SQLite database wrapper for VellumMem memory system.
-
-    Usage:
-        db = VellumDB("vellum.db")
-        db.initialize()  # creates tables if not exist
-        with db.connect() as conn:
-            conn.execute("SELECT ...")
-    """
+    """SQLite database wrapper for VellumMem memory system."""
 
     def __init__(self, db_path: str = "vellum.db"):
         self.db_path = db_path
@@ -29,15 +22,10 @@ class VellumDB:
             self._conn.execute("PRAGMA foreign_keys=ON")
         return self._conn
 
-    def close(self):
-        if self._conn:
-            self._conn.close()
-            self._conn = None
-
     # ── Initialization ─────────────────────────────────────────
 
     def initialize(self, schema_path: str | pathlib.Path | None = None):
-        """Create all tables if they don't exist.
+        """Create all tables if they don't exist, run migrations.
 
         Args:
             schema_path: Path to schema.sql. Auto-detects if None.
@@ -45,7 +33,7 @@ class VellumDB:
         if schema_path is None:
             schema_path = (
                 pathlib.Path(__file__).resolve().parent.parent
-                / "schema.sql"
+                / "schemas" / "schema.sql"
             )
         if isinstance(schema_path, str):
             schema_path = pathlib.Path(schema_path)
@@ -54,75 +42,88 @@ class VellumDB:
         conn.executescript(sql)
         conn.commit()
         self._migrate_config()
-        self._seed_defaults()
+        self._migrate_human_timeline()
 
     def _migrate_config(self):
-        """Upgrade config table from old 2-column to new 6-column schema."""
+        """Upgrade config table from old 2-column to new 6-column schema;
+        always ensure required defaults exist."""
         conn = self.connect()
         cols = [r["name"] for r in conn.execute(
             "PRAGMA table_info(config)"
         ).fetchall()]
         required = {"key", "value", "type", "description", "created_at", "updated_at"}
-        if set(cols) == required:
+        if set(cols) != required:
+            # Old 2-column schema → DROP + rebuild with old data preserved
+            old_data = dict(
+                conn.execute("SELECT key, value FROM config").fetchall()
+            )
+            conn.execute("DROP TABLE config")
+            conn.execute("""
+                CREATE TABLE config (
+                    key         TEXT PRIMARY KEY,
+                    value       TEXT NOT NULL DEFAULT '',
+                    type        TEXT NOT NULL DEFAULT 'str',
+                    description TEXT DEFAULT '',
+                    created_at  TEXT DEFAULT (datetime('now','localtime')),
+                    updated_at  TEXT DEFAULT (datetime('now','localtime'))
+                )
+            """)
+            for k, v in old_data.items():
+                conn.execute(
+                    "INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)",
+                    (k, v)
+                )
+
+        # 无论新库还是升级库，始终保证 2 条默认值存在
+        defaults = [
+            ("vector_engine",    "transformer", "str",   "向量引擎"),
+            ("score_threshold",  "0.15",        "float", "向量检索最低匹配分数"),
+        ]
+        conn.executemany(
+            "INSERT OR IGNORE INTO config (key, value, type, description) VALUES (?, ?, ?, ?)",
+            defaults
+        )
+        conn.commit()
+
+    def _migrate_human_timeline(self):
+        """Add category/is_time_sensitive columns; rebuild table to drop unused columns."""
+        conn = self.connect()
+        cols_info = conn.execute("PRAGMA table_info(human_timeline)").fetchall()
+        has_old_cols = any(c[1] in ("session_start", "session_end", "update_timestamp") for c in cols_info)
+        if has_old_cols:
+            # Rebuild table — drop session_start/session_end/update_timestamp
+            conn.execute("""
+                CREATE TABLE human_timeline_v7 (
+                    id                        TEXT PRIMARY KEY,
+                    summary                   TEXT DEFAULT '',
+                    tags                      TEXT DEFAULT '[]',
+                    conversation_context_link TEXT DEFAULT '[]',
+                    category                  TEXT DEFAULT 'conversation',
+                    is_time_sensitive         INTEGER DEFAULT 0,
+                    create_timestamp          INTEGER NOT NULL
+                )
+            """)
+            conn.execute("""
+                INSERT INTO human_timeline_v7
+                    (id, summary, tags, conversation_context_link,
+                     category, is_time_sensitive, create_timestamp)
+                SELECT id, summary, tags, conversation_context_link,
+                       IFNULL(category, 'conversation'),
+                       IFNULL(is_time_sensitive, 0), create_timestamp
+                FROM human_timeline
+            """)
+            conn.execute("DROP TABLE human_timeline")
+            conn.execute("ALTER TABLE human_timeline_v7 RENAME TO human_timeline")
+            conn.commit()
             return
-        # Save old data before dropping
-        old_data = dict(
-            conn.execute("SELECT key, value FROM config").fetchall()
-        )
-        conn.execute("DROP TABLE config")
-        conn.execute("""
-            CREATE TABLE config (
-                key         TEXT PRIMARY KEY,
-                value       TEXT NOT NULL DEFAULT '',
-                type        TEXT NOT NULL DEFAULT 'str',
-                description TEXT DEFAULT '',
-                created_at  TEXT DEFAULT (datetime('now','localtime')),
-                updated_at  TEXT DEFAULT (datetime('now','localtime'))
-            )
-        """)
-        # Restore old data with new schema defaults
-        for k, v in old_data.items():
-            conn.execute(
-                "INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)",
-                (k, v)
-            )
-        # Seed standard defaults (INSERT OR IGNORE so old values survive)
-        defaults = [
-            ("mode",          "human",        "str",   "当前检索模式: human / code"),
-            ("project_id",    "",             "str",   "当前绑定的项目 ID"),
-            ("project_path",  "",             "str",   "当前绑定的项目路径"),
-            ("vector_engine", "transformer",  "str",   "向量引擎"),
-            ("score_threshold", "0.15",       "float", "向量检索最低匹配分数"),
-        ]
-        conn.executemany(
-            "INSERT OR IGNORE INTO config (key, value, type, description) VALUES (?, ?, ?, ?)",
-            defaults
-        )
-        conn.commit()
 
-    def _seed_defaults(self):
-        """Ensure required config keys exist (no-op if already present)."""
-        conn = self.connect()
-        defaults = [
-            ("mode",          "human",        "str",   "当前检索模式: human / code"),
-            ("project_id",    "",             "str",   "当前绑定的项目 ID"),
-            ("project_path",  "",             "str",   "当前绑定的项目路径"),
-            ("vector_engine", "transformer",  "str",   "向量引擎"),
-            ("score_threshold", "0.15",       "float", "向量检索最低匹配分数"),
-        ]
-        conn.executemany(
-            "INSERT OR IGNORE INTO config (key, value, type, description) VALUES (?, ?, ?, ?)",
-            defaults
-        )
+        # No old columns — just ensure category/is_time_sensitive exist
+        existing = {r[1] for r in cols_info}
+        if "category" not in existing:
+            conn.execute("ALTER TABLE human_timeline ADD COLUMN category TEXT DEFAULT 'conversation'")
+        if "is_time_sensitive" not in existing:
+            conn.execute("ALTER TABLE human_timeline ADD COLUMN is_time_sensitive INTEGER DEFAULT 0")
         conn.commit()
-
-    def is_initialized(self) -> bool:
-        """Check if the database has been initialized."""
-        conn = self.connect()
-        row = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='config'"
-        ).fetchone()
-        return row is not None
 
     # ── Helpers ────────────────────────────────────────────────
 
@@ -136,7 +137,6 @@ class VellumDB:
         """Return row counts for all main tables."""
         tables = [
             "human_timeline", "conversation_context",
-            "projects", "file_map", "decisions", "tasks",
-            "config",
+            "memory_groups", "config",
         ]
         return {t: self.table_count(t) for t in tables}

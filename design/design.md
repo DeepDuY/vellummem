@@ -1,7 +1,9 @@
-# VellumMem — 检索设计 v1
+# VellumMem — 设计文档 v6
 
-> 设计定稿：2026-04-29
 > 状态：已实装 ✅
+> 内核：Human-only 纯记忆系统
+> 检索：预合并向量（1 向量/条）
+> 分组：Clique Percolation Method (CPM, k=3)
 
 ---
 
@@ -9,173 +11,151 @@
 
 ### 核心问题
 
-记忆系统需要让 AI 用自然语言快速找到过去的会话。传统的双层检索（关键词 + 向量）在自然语言查询下表现不佳：
-
-| 问题 | 描述 |
-|:----|:------|
-| 关键词太宽或太窄 | OR 拆词把噪音全放进来，AND 匹配自然语言永远 0 条 |
-| 阈值静默丢弃 | 向量层硬阈值导致语义相似但分数略低的匹配被丢弃 |
-| 返回分数无意义 | 关键词命中返回 `score=1.0`，AI 无法判断匹配质量 |
-| 存储膨胀 | 每条记忆存 6 个向量（1 summary + 5 tags），1000 条 = 6000 行 |
+AI 需要跨会话的持久记忆，但：
+- 每次对话从零开始
+- 传统双层检索（关键词 + 向量）在自然语言查询下表现差
+- 外部向量数据库增加运维成本
 
 ### 设计原则
 
 | 原则 | 说明 |
-|:----|:------|
-| **单层检索** | 不搞关键词 + 向量两层，统一走语义向量 |
-| **真实分数** | 返回 0~1 的余弦相似度，AI 自行判断相关性 |
-| **可配置阈值** | 低于阈值的匹配不返回（默认 0.15） |
-| **贪婪模式** | top_k 可调大，需要更多结果时用 |
-| **零外部依赖** | 一个 SQLite 文件 + 本地模型，不需外部服务 |
+|------|------|
+| **单层语义检索** | 不搞关键词 + 向量两层，统一走余弦相似度 |
+| **真实分数** | 返回 0~1 余弦相似度，AI 自行判断相关性 |
+| **可配置阈值** | 低于 `score_threshold`（默认 0.15）不返回 |
+| **贪婪模式** | `top_k` 可调大获取更多结果 |
+| **零外部依赖** | 单 SQLite 文件 + 本地模型，无外部服务 |
+| **纯 Human，无 Code 模式** | 删除了 Project/File/Decision/Task 等 code 专用存储 |
 
 ---
 
-## 二、方案选择
+## 二、检索设计：预合并向量
 
-### 方案①：5 tag 分别评分
+### 数学原理
 
-每条记忆存 6 个独立向量（1 summary + 5 tags），查询时分别计算余弦相似度后取平均：
-
-```
-score = (query·summary + query·tag0 + ... + query·tag4) / 6
-```
-
-✅ 质量好，每个 tag 独立贡献语义
-❌ 6 个向量/条，存储大，查询慢
-
-### 方案②：5 tag 拼接评分
-
-5 个 tag 拼接成一个字符串"vellummem v4 重构 transformer bge"然后编码为一个向量：
+每条记忆包含 1 段摘要 + 5 个标签。最精确的评分方式是分别计算每个维度与查询的相似度后取平均：
 
 ```
-score = (query·summary + query·concat_tags) / 2
+score = (q·s + q·t₀ + q·t₁ + q·t₂ + q·t₃ + q·t₄) / 6
 ```
 
-✅ 存储小（2 向量/条）
-❌ 质量不如方案①（拼接后 tag 粒度丢失）
-
-### 方案③：预合并向量 ✅ **最终方案**
-
-核心洞察：向量内积是线性运算。
+向量内积是线性运算，可以合并为一次运算：
 
 ```
-score = (query·summary + query·tag0 + ... + query·tag4) / 6
-      = query · (summary + tag0 + ... + tag4) / 6
+score = q · (s + t₀ + t₁ + t₂ + t₃ + t₄) / 6
 ```
 
-**6 次内积的平均值 = 1 次内积与平均向量的点积。**
+**关键约束**：各分量必须事先归一化，合并后**不二次归一化**，否则分数改变。
 
-| 对比 | 分别评分 | 预合并 ✅ |
-|:----|:--------|:---------|
-| 存储 | 6 向量/条 | **1 向量/条** |
-| SQLite 行数(1000条) | 6000 行 | **1000 行** |
-| 查询(1000条) | 6000 次内积 | **1000 次内积** |
-| 查询耗时 | ~147ms | **~38ms** |
-| 检索质量 | ✅ 最好 | ✅ **数学等价** |
-| 实现复杂度 | 复杂（6 向量管理） | **简单（1 向量管理）** |
+### 存储对比
 
-**关键约束**：预合并后不能二次归一化，否则分数改变。
+| 方案 | 向量/条 | SQLite 行数(1000条) | 查询内积次数 | 检索质量 |
+|------|---------|--------------------|-------------|---------|
+| 分别存储 6 向量 | 6 | 6000 | 6000 | ✅ 最好 |
+| 预合并 ✅ | **1** | **1000** | **1000** | ✅ **数学等价** |
 
-### 方案②补充验证：5 tag 拼接
-
-| 查询 | 方案①(分别) | 方案②(拼接) | 方案③(纯拼) |
-|:----|:-----------|:-----------|:-----------|
-| 「vellummem的开发进度」 | ✅ A > C > B | ❌ B > A > C | ❌ B > C > A |
-| 「向量引擎如何配置」 | ⚠️ Docker > A | ✅ A > Docker | ❌ Docker > A |
-| 「docker 端口映射」 | ✅ Docker > C > A | ✅ Docker > B > C | ✅ Docker > C > B |
-
-拼接方案不稳定，不如分别评分。预合并向量兼具分别评分的质量和拼接方案的存储效率。
-
-### 数学等价性验证
-
-通过 10000 次随机向量测试：
-
-```
-max diff:    1.06e-08  (float32 精度级)
-mean diff:   2.10e-09
-diff > 1e-7: 0 次
-```
-
-检索所需的精度是 0.01（百分位），差异小 100 万倍。实用层面完全等价。
-
----
-
-## 三、检索流程
-
-### 写入
+### 写入流程
 
 ```python
-# 强制校验 5 个 tag（不足报错）
-assert len(tags) == 5
-
-# 编码
-sv = model.encode(summary, normalize_embeddings=True)     # (512,)
-tv = model.encode(tags, normalize_embeddings=True)          # (5, 512)
-
-# 预合并（先归一化各分量，再平均，不二次归一化）
-merged = (sv + tv.sum(axis=0)) / 6.0                        # (512,)
-
-# 存储
-INSERT INTO entry_vectors VALUES (?, pickle.dumps(merged))
+sv = model.encode(summary, normalize_embeddings=True)   # (512,)
+tv = model.encode(tags, normalize_embeddings=True)       # (5, 512)
+merged = (sv + tv.sum(axis=0)) / 6.0                     # (512,)
+# pickle.dumps → INSERT INTO entry_vectors
 ```
 
-### 查询
+### 查询流程
 
 ```python
-def memory_query(text, top_k=3, score_threshold=0.15):
-    qv = model.encode(text, normalize_embeddings=True)       # ~20ms
-    
-    for entry in load_all():
-        merged = pickle.loads(entry.merged_blob)              # ~2KB/条
-        score = float(qv @ merged)                            # 1 次内积
-        
-        if score >= score_threshold:
-            results.append((score, entry))
-    
-    results.sort(key=lambda x: -x[0])
-    return results[:top_k]
+qv = model.encode(query, normalize_embeddings=True)      # ~20ms
+for entry_vectors:
+    score = float(qv @ merged_blob)                      # 1 次内积/条
+    if score >= threshold: results.append(...)
+return sorted(results, key=-score)[:top_k]
 ```
 
 ### 性能（1000 条）
 
 | 环节 | 耗时 |
-|:----|:----|
+|------|------|
 | query encode | ~20ms |
-| SQLite 读 1000 BLOB | ~5ms |
-| pickle 反序列化 | ~10ms |
-| 内积运算 × 1000 | ~2ms |
+| SQLite 读 BLOB + pickle | ~15ms |
+| 内积 × 1000 | ~2ms |
 | 排序 | <1ms |
 | **总计** | **~38ms** |
 
+### 数学等价性验证
+
+10000 次随机向量测试：
+- max diff: **1.06e-08**（float32 精度级）
+- mean diff: **2.10e-09**
+- diff > 1e-7: **0 次**
+
+检索所需精度为 0.01（百分位），差异小 100 万倍，实用层面完全等价。
+
 ---
 
-## 四、数据库设计
+## 三、分组设计：CPM k=3
 
-### human_timeline 表
+### 为什么需要分组
+
+语义检索返回的是分散的记忆条目，分组让 AI 能发现记忆之间的关联结构。
+例如：多条关于"架构重构"的记忆自动组成一组，AI 可以一次性拉取整个组的上下文。
+
+### 算法：Clique Percolation Method
+
+```
+输入：所有条目的预合并向量
+  1. 计算两两余弦相似度，相似度 ≥ threshold 的连边
+  2. 找出所有三角形（3-clique），即互相连通的三元组
+  3. 两个三角形共享一条边（k-1=2 个节点）时认为属于同一社区
+  4. 在三角形图（clique graph）上做连通分量 → 社区
+输出：每个社区 = 一个记忆分组
+```
+
+### 关键参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `k` | 3 | 团大小（仅支持 k=3，即三角形） |
+| `threshold` | 0.8 | 余弦相似度阈值 |
+| 重叠 | 允许 | 一条记忆可属于多个分组 |
+
+### 存储
+
+```sql
+CREATE TABLE memory_groups (
+    id               TEXT PRIMARY KEY,
+    entry_ids        TEXT NOT NULL DEFAULT '[]',  -- JSON 数组
+    member_count     INTEGER DEFAULT 0,
+    create_timestamp INTEGER NOT NULL
+);
+```
+
+### 启动构建
+
+`_ensure_init()` 末尾自动调用 `build_groups(k=3, threshold=0.8)`。
+新条目写入后需要手动调用 `memory_rebuild_groups` 重新构建。
+
+---
+
+## 四、数据库 Schema v7
+
+### human_timeline（核心表）
 
 ```sql
 CREATE TABLE human_timeline (
-    id                        TEXT PRIMARY KEY,             -- YMD_HMS_5RAND
-    session_start             TEXT NOT NULL,                -- ISO datetime
-    session_end               TEXT NOT NULL,                -- ISO datetime
+    id                        TEXT PRIMARY KEY,
     summary                   TEXT DEFAULT '',              -- 上限 200 字
     tags                      TEXT DEFAULT '[]',            -- JSON 数组，固定 5 个
-    conversation_context_link TEXT DEFAULT '[]',            -- JSON 数组
-    create_timestamp          INTEGER NOT NULL,
-    update_timestamp          INTEGER NOT NULL
+    conversation_context_link TEXT DEFAULT '[]',            -- 有序上下文 ID 数组
+    category                  TEXT DEFAULT 'conversation',  -- conversation/knowledge/document/preference/other
+    is_time_sensitive         INTEGER DEFAULT 0,
+    create_timestamp          INTEGER NOT NULL
 );
 ```
 
-### entry_vectors 表
 
-```sql
-CREATE TABLE entry_vectors (
-    entry_id    TEXT PRIMARY KEY REFERENCES human_timeline(id) ON DELETE CASCADE,
-    merged_blob BLOB NOT NULL   -- pickle.dumps(np.ndarray(float32, 512))
-);
-```
-
-### conversation_context 表
+### conversation_context
 
 ```sql
 CREATE TABLE conversation_context (
@@ -187,117 +167,149 @@ CREATE TABLE conversation_context (
 );
 ```
 
+### entry_vectors
+
+```sql
+CREATE TABLE entry_vectors (
+    entry_id    TEXT PRIMARY KEY REFERENCES human_timeline(id) ON DELETE CASCADE,
+    merged_blob BLOB NOT NULL    -- pickle.dumps(np.ndarray(float32, 512))
+);
+```
+
+### memory_groups
+
+```sql
+CREATE TABLE memory_groups (
+    id               TEXT PRIMARY KEY,
+    entry_ids        TEXT NOT NULL DEFAULT '[]',  -- JSON 数组
+    member_count     INTEGER DEFAULT 0,
+    create_timestamp INTEGER NOT NULL
+);
+```
+
+### config
+
+```sql
+CREATE TABLE config (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL DEFAULT '',
+    type        TEXT NOT NULL DEFAULT 'str',
+    description TEXT DEFAULT '',
+    created_at  TEXT DEFAULT (datetime('now','localtime')),
+    updated_at  TEXT DEFAULT (datetime('now','localtime'))
+);
+```
+
 ---
 
 ## 五、MCP 接口
 
-### memory_query
+### 记忆写入
 
-```json
-memory_query(query, mode?, top_k=3, score_threshold=0.15)
+```
+memory_write(data: str) -> str
+  data 字段：
+    - summary: str          必填，上限 200 字
+    - tags: [str]           必填，必须 5 个
+    - context_text: str     选填，上下文原文
+    - category: str         必填，conversation/knowledge/document/preference/other
+    - is_time_sensitive: bool  选填
 ```
 
-| 参数 | 说明 |
-|:----|:------|
-| `query` | 自然语言查询文本 |
-| `mode` | "human"（向量检索）或 "code"（关键词/FTS5），默认 session 模式 |
-| `top_k` | 返回条数，默认 3；设大值即贪婪模式 |
-| `score_threshold` | 最低匹配分数，默认 0.15，低于此值返回空 |
+### 查询
 
-返回每个结果的**真实分数**（0~1 余弦相似度），不再固定返回 1.0。
-
-### memory_write
-
-```json
-memory_write(data, mode?)
+```
+memory_query(query: str, top_k: int = 3, score_threshold: float = 0.15) -> str
 ```
 
-- `data.tags` 在 human 模式下**必须提供 5 个**，不足报错
-- 自动计算预合并向量并持久化
-- 自动分片存储 conversation_context
+### 上下文管理
 
-### 其他接口
+```
+memory_get_context(timeline_id: str, offset: int = 0, limit: int = 1) -> str
+memory_write_context(timeline_id: str, context_text: str) -> str
+```
 
-| 接口 | 说明 |
-|:----|:------|
-| `memory_init` | 初始化会话，可选绑定项目 |
-| `memory_get_context` | 获取上下文分片（从最新往前翻） |
-| `memory_set_mode` | 切换 human / code 模式 |
-| `memory_write_context` | 追加上下文分片 |
-| `memory_project_sync` | 同步项目文件索引 |
-| `memory_status` | 查看系统状态 |
+### 分组
 
----
+```
+memory_get_groups(entry_id: str) -> str
+memory_get_group_members(group_id: str) -> str
+memory_rebuild_groups(threshold: float = 0.8) -> str
+```
 
-## 六、配置项
+### 状态
 
-| 配置键 | 默认值 | 类型 | 说明 |
-|:------|:-------|:----|:------|
-| `mode` | `human` | str | 当前检索模式 |
-| `vector_engine` | `transformer` | str | 向量引擎 |
-| `score_threshold` | `0.15` | float | 向量检索最低匹配分数 |
-
-**环境变量**：
-
-| 变量 | 默认值 | 说明 |
-|:-----|:-------|:------|
-| `VELLUM_DB_PATH` | `./vellum.db` | SQLite 路径 |
-| `VELLUM_TRANSFORMER_MODEL` | `BAAI/bge-small-zh-v1.5` | 向量模型 |
+```
+memory_init() -> str
+memory_status() -> str
+```
 
 ---
 
-## 七、模型选择
+## 六、架构
 
-**最终选用：BAAI/bge-small-zh-v1.5**（512 维，~36MB）
+### 初始化流程
 
-对比实验 `"vellummem的开发进度"`：
+```
+_ensure_init() [延迟初始化，首次工具调用时触发]
+  1. 解析数据库路径（VELLUM_DB_PATH 环境变量或默认）
+  2. 连接 SQLite + executescript schema.sql
+  3. 迁移 config 表（2列 → 6列）+ 写入默认值
+  4. 迁移 human_timeline 表（补 category/is_time_sensitive；v7 重建去死字段）
+  5. 初始化 VectorAdapter（加载 sentence-transformers 模型 + 已有向量）
+  6. 构建 CPM 分组（build_groups k=3 threshold=0.8）
+```
 
-| 排名 | MiniLM | bge | 说明 |
-|:----:|:------|:----|:------|
-| 1 | B(0.52) | **A(0.467)** | bge 将真正相关的 A 从第 3 提到第 1 |
-| 2 | C(0.42) | C(0.451) | |
-| 3 | A(0.31) | B(0.443) | |
-| 4 | Docker(0.23) | Docker(0.357) | |
+### 线程安全
 
-bge 的语义理解能力显著优于 MiniLM，对于中文自然语言查询的匹配质量更高。
+使用双检锁（double-checked locking）确保惰性初始化安全：
+
+```python
+_init_lock = threading.Lock()
+
+def _ensure_init():
+    if _vector is not None:       # 快速路径（无锁）
+        return
+    with _init_lock:              # 慢速路径（加锁）
+        if _vector is not None:   # 重复检查
+            return
+        # ... 实际初始化 ...
+```
+
+### 异常层次
+
+```
+VellumMemError (Exception)
+ ├── StoreError        — 存储层异常（无效 category、不足 5 tag）
+ ├── VectorError       — 向量引擎异常
+ └── InitError         — 初始化异常（模型加载失败、下载超时）
+```
+
+`@_tool` 装饰器统一捕获并返回 JSON 错误消息。
 
 ---
 
-## 八、验证结果
+## 七、项目结构
 
-### 端到端链路测试（E2E）
-
-| 测试 | 结果 |
-|:----|:------|
-| `memory_write` → `memory_query` | ✅ 存储后检索可召回，返回真实分数 0.55+ |
-| 相关查询「vellummem 检索方案」 | ✅ 正例排第一，分数 0.58 |
-| 不相关查询「红烧肉做法」 | ✅ 分数降至 0.25 |
-| `score_threshold=0.25` 过滤 | ✅ 低于阈值返回空 |
-| `top_k=5` 贪婪模式 | ✅ 返回 5 条 |
-| `memory_get_context` | ✅ 返回正确分片，支持 offset/limit 翻页 |
-
-### 多场景排名验证
-
-| 场景 | 查询数 | 排名一致 |
-|:----|:------|:--------|
-| 自然会话（旅游/养猫/健身） | 3 | ✅ |
-| 技术知识（async/索引/K8s） | 3 | ✅ |
-| 项目追踪（登录/支付/推送） | 3 | ✅ |
-| 跨域模糊（缓存/限流/日志） | 3 | ✅ |
+```
+vellum/
+├── __init__.py               # 版本号
+├── server.py                 # MCP 入口 + @mcp.tool() × 9 + @_tool 装饰器
+├── db.py                     # SQLite 连接 + Schema 初始化 + 迁移
+├── errors.py                 # 异常层次（VellumMemError 基类）
+├── groups.py                 # CPM k=3 分组管理器
+├── stores/
+│   ├── __init__.py
+│   └── human_timeline.py     # 人类记忆 CRUD + 上下文分片
+└── vector/
+    ├── __init__.py
+    └── adapter.py            # sentence-transformers 适配器 + 预合并向量
+schemas/
+└── schema.sql                # 统一建表 SQL（v7）
+tests/
+├── __init__.py
+├── test_errors.py            # 异常层级测试（6 tests）
+└── test_stores.py            # store CRUD + 上下文分片 + DB 初始化测试（13 tests）
+```
 
 ---
-
-## 九、设计决策
-
-| # | 决策 | 结论 |
-|:--|:----|:------|
-| 1 | tag 数量 | 固定 **5 个**，不足报错（不自动生成） |
-| 2 | 评分方式 | **预合并向量**（1 个内积 = 6 个内积的平均值） |
-| 3 | 检索层数 | **单层向量检索**，无关键词降级 |
-| 4 | 阈值行为 | **0.15**，可配置，低于阈值返回空 |
-| 5 | 返回分数 | **真实余弦相似度**（0~1），非二元命中 |
-| 6 | top_k 行为 | 默认 **3**，可调大（贪婪模式） |
-| 7 | hybrid 模式 | **移除**，只有 human / code 两种模式 |
-| 8 | key_moments | **移除**，human_timeline 不再包含此字段 |
-| 9 | LSI 降级 | **不提供**，强制依赖 Transformer 模型 |
-| 10 | 旧数据迁移 | **不迁移**，直接重建数据库 |

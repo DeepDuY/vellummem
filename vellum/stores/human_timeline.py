@@ -19,6 +19,8 @@ import typing
 if typing.TYPE_CHECKING:
     from ..db import VellumDB
 
+from ..errors import StoreError
+
 # ── 分隔符（按优先级从高到低） ────────────────────────────────
 
 CONTEXT_SEPARATORS = [
@@ -111,42 +113,50 @@ class HumanTimelineStore:
 
     def create(self, *, summary: str = "",
                tags: list | None = None,
-               session_start: str | None = None,
-               context_text: str | None = None) -> dict:
+               context_text: str | None = None,
+               category: str,
+               is_time_sensitive: bool = False) -> dict:
         """创建一条 human_timeline 记录。
 
         Args:
             summary: 会话摘要（上限 200 字）
             tags: 5 个主题标签（强制 len==5，否则报错）
-            session_start: ISO datetime
             context_text: 初始上下文原文
+            category: 记忆类型（conversation/knowledge/document/preference/other）
+            is_time_sensitive: 内容是否随时间可能失效
 
         Raises:
             ValueError: tags 不足 5 个时抛出
+            ValueError: category 无效时抛出
         """
+        valid_categories = {"conversation", "knowledge", "document", "preference", "other"}
+        if category not in valid_categories:
+            raise StoreError(
+                f"无效 category: {category}，可选 {valid_categories}"
+            )
+
         # 强制校验 5 个 tag
         if not tags or len(tags) != 5:
-            raise ValueError(
+            raise StoreError(
                 f"memory_write 必须提供 5 个 tag，当前 {len(tags) if tags else 0} 个"
             )
 
         hid = _next_human_id()
         now = _now_ms()
-        start = session_start or time.strftime("%Y-%m-%dT%H:%M:%S")
 
         conn = self.db.connect()
         conn.execute("""
             INSERT INTO human_timeline
-                (id, session_start, session_end, summary,
-                 tags, conversation_context_link,
-                 create_timestamp, update_timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (id, summary, tags, conversation_context_link,
+                 category, is_time_sensitive, create_timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
         """, (
-            hid, start, start,
+            hid,
             (summary or "")[:200],
             json.dumps(tags, ensure_ascii=False),
             "[]",
-            now, now,
+            category, int(is_time_sensitive),
+            now,
         ))
         conn.commit()
 
@@ -195,24 +205,11 @@ class HumanTimelineStore:
             return
         link = json.loads(row["conversation_context_link"] or "[]")
         link.extend(new_ids)
-        now = _now_ms()
         conn.execute("""
             UPDATE human_timeline
-            SET conversation_context_link = ?, update_timestamp = ?
+            SET conversation_context_link = ?
             WHERE id = ?
-        """, (json.dumps(link, ensure_ascii=False), now, timeline_id))
-        conn.commit()
-
-    def update_session_end(self, timeline_id: str):
-        """标记会话结束时间。"""
-        now = time.strftime("%Y-%m-%dT%H:%M:%S")
-        ts = _now_ms()
-        conn = self.db.connect()
-        conn.execute("""
-            UPDATE human_timeline
-            SET session_end = ?, update_timestamp = ?
-            WHERE id = ?
-        """, (now, ts, timeline_id))
+        """, (json.dumps(link, ensure_ascii=False), timeline_id))
         conn.commit()
 
     # ── 读取 ──────────────────────────────────────────────────
@@ -223,14 +220,6 @@ class HumanTimelineStore:
             "SELECT * FROM human_timeline WHERE id = ?", (tid,)
         ).fetchone()
         return _row_to_dict(row) if row else None
-
-    def list_recent(self, limit: int = 20) -> list[dict]:
-        conn = self.db.connect()
-        rows = conn.execute(
-            "SELECT * FROM human_timeline ORDER BY create_timestamp DESC LIMIT ?",
-            (limit,)
-        ).fetchall()
-        return [_row_to_dict(r) for r in rows]
 
     # ── 上下文读取 ────────────────────────────────────────────
 
