@@ -76,8 +76,10 @@ class VellumDB:
 
         # 无论新库还是升级库，始终保证 2 条默认值存在
         defaults = [
-            ("vector_engine",    "transformer", "str",   "向量引擎"),
-            ("score_threshold",  "0.15",        "float", "向量检索最低匹配分数"),
+            ("vector_engine",     "transformer", "str",   "向量引擎"),
+            ("score_threshold",   "0.15",        "float", "向量检索最低匹配分数"),
+            ("group_threshold",   "0.45",        "float", "记忆分组余弦相似度阈值"),
+            ("group_k",           "4",           "int",   "CPM 分组 k 值"),
         ]
         conn.executemany(
             "INSERT OR IGNORE INTO config (key, value, type, description) VALUES (?, ?, ?, ?)",
@@ -86,12 +88,15 @@ class VellumDB:
         conn.commit()
 
     def _migrate_human_timeline(self):
-        """Add category/is_time_sensitive columns; rebuild table to drop unused columns."""
+        """Add category/is_time_sensitive columns; rebuild table to drop unused columns.
+        Auto-add ttl_timestamp for existing v7 tables."""
         conn = self.connect()
         cols_info = conn.execute("PRAGMA table_info(human_timeline)").fetchall()
-        has_old_cols = any(c[1] in ("session_start", "session_end", "update_timestamp") for c in cols_info)
+        col_names = {c[1] for c in cols_info}
+        has_old_cols = any(c in ("session_start", "session_end", "update_timestamp") for c in col_names)
+
         if has_old_cols:
-            # Rebuild table — drop session_start/session_end/update_timestamp
+            # Full rebuild — drop session_start/session_end/update_timestamp
             conn.execute("""
                 CREATE TABLE human_timeline_v7 (
                     id                        TEXT PRIMARY KEY,
@@ -100,7 +105,8 @@ class VellumDB:
                     conversation_context_link TEXT DEFAULT '[]',
                     category                  TEXT DEFAULT 'conversation',
                     is_time_sensitive         INTEGER DEFAULT 0,
-                    create_timestamp          INTEGER NOT NULL
+                    create_timestamp          INTEGER NOT NULL,
+                    ttl_timestamp             INTEGER DEFAULT NULL
                 )
             """)
             conn.execute("""
@@ -117,12 +123,14 @@ class VellumDB:
             conn.commit()
             return
 
-        # No old columns — just ensure category/is_time_sensitive exist
+        # No old columns — ensure category/is_time_sensitive/ttl_timestamp exist
         existing = {r[1] for r in cols_info}
         if "category" not in existing:
             conn.execute("ALTER TABLE human_timeline ADD COLUMN category TEXT DEFAULT 'conversation'")
         if "is_time_sensitive" not in existing:
             conn.execute("ALTER TABLE human_timeline ADD COLUMN is_time_sensitive INTEGER DEFAULT 0")
+        if "ttl_timestamp" not in existing:
+            conn.execute("ALTER TABLE human_timeline ADD COLUMN ttl_timestamp INTEGER DEFAULT NULL")
         conn.commit()
 
     # ── Helpers ────────────────────────────────────────────────

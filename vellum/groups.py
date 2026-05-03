@@ -1,9 +1,9 @@
-"""Memory group manager — Clique Percolation Method (CPM, k=3).
+"""Memory group manager — Clique Percolation Method (CPM, arbitrary k).
 
 Groups semantically similar entries (cosine similarity ≥ threshold)
-using the Clique Percolation Method with k=3 (triangle-based).
+using the Clique Percolation Method with configurable k.
 
-Two triangles belong to the same community when they share an edge.
+Two k-cliques belong to the same community when they share k-1 nodes.
 Communities can overlap (one entry may belong to multiple groups).
 """
 
@@ -34,8 +34,63 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _find_k_cliques(adj: dict[str, set], k: int, entry_ids: list[str]) -> list[frozenset]:
+    """Find all k-cliques in the graph defined by adjacency list.
+
+    Uses bottom-up extension: 2-cliques → 3-cliques → ... → k-cliques.
+    Each step finds candidates by intersecting adjacency sets of all members.
+
+    Args:
+        adj: {node: {neighbors}}
+        k: Target clique size (k >= 2)
+        entry_ids: All node IDs
+
+    Returns:
+        List of frozensets, each containing k node IDs forming a clique
+    """
+    if k < 2:
+        return []
+
+    # All edges (2-cliques)
+    edges = []
+    for a in entry_ids:
+        for b in adj[a]:
+            if b > a:
+                edges.append(frozenset({a, b}))
+    if k == 2:
+        return edges
+
+    cur = edges
+    for size in range(3, k + 1):
+        nxt = []
+        seen = set()
+        for clique in cur:
+            # Nodes adjacent to ALL members of this clique
+            candidates = None
+            for m in clique:
+                if candidates is None:
+                    candidates = set(adj[m])
+                else:
+                    candidates &= adj[m]
+                if not candidates:
+                    break
+            if candidates:
+                for c in candidates:
+                    if c in clique:
+                        continue
+                    nc = frozenset(clique | {c})
+                    if nc not in seen:
+                        seen.add(nc)
+                        nxt.append(nc)
+        cur = nxt
+        if not cur:
+            break
+
+    return cur
+
+
 class GroupManager:
-    """Builds and queries memory groups via CPM (k=3)."""
+    """Builds and queries memory groups via CPM (arbitrary k)."""
 
     def __init__(self, db: VellumDB, vector: VectorAdapter):
         self.db = db
@@ -43,11 +98,11 @@ class GroupManager:
 
     # ── CPM Group Building ──────────────────────────────────
 
-    def build_groups(self, k: int = 3, threshold: float = 0.8) -> dict:
+    def build_groups(self, k: int = 4, threshold: float = 0.8) -> dict:
         """Run CPM and store groups in memory_groups table.
 
         Args:
-            k: Clique size (only k=3 is implemented).
+            k: Clique size (default 4). Must be >= 2.
             threshold: Minimum cosine similarity for an edge.
 
         Returns:
@@ -55,9 +110,9 @@ class GroupManager:
         """
         vectors = self._vector.all_vectors
         entry_ids = list(vectors.keys())
+        k = max(2, k)
 
         if len(entry_ids) < k:
-            # Too few entries, clear existing groups
             conn = self.db.connect()
             conn.execute("DELETE FROM memory_groups")
             conn.commit()
@@ -71,37 +126,28 @@ class GroupManager:
                 adj[a].add(b)
                 adj[b].add(a)
 
-        # 2. Find all triangles (3-cliques)
-        triangles = []
-        for a in entry_ids:
-            for b in adj[a]:
-                if b <= a:
-                    continue
-                for c in adj[a] & adj[b]:
-                    if c <= b:
-                        continue
-                    triangles.append(frozenset({a, b, c}))
-
-        if not triangles:
+        # 2. Find all k-cliques using generalized algorithm
+        cliques = _find_k_cliques(adj, k, entry_ids)
+        if not cliques:
             conn = self.db.connect()
             conn.execute("DELETE FROM memory_groups")
             conn.commit()
             return {"groups_built": 0, "entries": len(entry_ids)}
 
-        # 3. Build clique adjacency (share k-1 = 2 nodes → edge)
+        # 3. Build clique adjacency (share k-1 nodes → edge)
         clique_adj = defaultdict(set)
-        for i, c1 in enumerate(triangles):
-            for j, c2 in enumerate(triangles):
+        for i, c1 in enumerate(cliques):
+            for j, c2 in enumerate(cliques):
                 if i >= j:
                     continue
-                if len(c1 & c2) >= k - 1:  # share an edge
+                if len(c1 & c2) >= k - 1:
                     clique_adj[i].add(j)
                     clique_adj[j].add(i)
 
         # 4. Connected components in clique graph → communities
         visited = set()
         communities = []
-        for i in range(len(triangles)):
+        for i in range(len(cliques)):
             if i in visited:
                 continue
             stack = [i]
@@ -111,7 +157,7 @@ class GroupManager:
                 if node in visited:
                     continue
                 visited.add(node)
-                community_nodes.update(triangles[node])
+                community_nodes.update(cliques[node])
                 for nb in clique_adj[node]:
                     if nb not in visited:
                         stack.append(nb)
@@ -147,6 +193,17 @@ class GroupManager:
                     "member_count": row["member_count"],
                 })
         return result
+
+    def list_groups(self) -> list[dict]:
+        """Return all groups with their metadata."""
+        conn = self.db.connect()
+        rows = conn.execute("SELECT * FROM memory_groups ORDER BY create_timestamp DESC").fetchall()
+        return [{
+            "id": row["id"],
+            "entry_ids": json.loads(row["entry_ids"] or "[]"),
+            "member_count": row["member_count"],
+            "create_timestamp": row["create_timestamp"],
+        } for row in rows]
 
     def get_group_members(self, group_id: str) -> dict | None:
         """Return entry_ids in this group."""

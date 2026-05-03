@@ -1,9 +1,9 @@
-# VellumMem — 设计文档 v6
+# VellumMem — 设计文档 v7
 
 > 状态：已实装 ✅
 > 内核：Human-only 纯记忆系统
 > 检索：预合并向量（1 向量/条）
-> 分组：Clique Percolation Method (CPM, k=3)
+> 分组：Clique Percolation Method (CPM, 支持任意 k，默认 4)
 
 ---
 
@@ -94,21 +94,23 @@ return sorted(results, key=-score)[:top_k]
 
 ---
 
-## 三、分组设计：CPM k=3
+## 三、分组设计：CPM（支持任意 k，默认 4）
 
 ### 为什么需要分组
 
 语义检索返回的是分散的记忆条目，分组让 AI 能发现记忆之间的关联结构。
 例如：多条关于"架构重构"的记忆自动组成一组，AI 可以一次性拉取整个组的上下文。
 
-### 算法：Clique Percolation Method
+### 算法：Clique Percolation Method（通用化）
 
 ```
 输入：所有条目的预合并向量
   1. 计算两两余弦相似度，相似度 ≥ threshold 的连边
-  2. 找出所有三角形（3-clique），即互相连通的三元组
-  3. 两个三角形共享一条边（k-1=2 个节点）时认为属于同一社区
-  4. 在三角形图（clique graph）上做连通分量 → 社区
+  2. 从 2-clique（边）开始，逐级扩展至 k-clique
+     - 候选节点 = 与当前 clique 所有成员的邻接集交集
+     - 以去重 frozenset 存储已发现的 clique
+  3. 两个 k-clique 共享 k-1 个节点时认为属于同一社区
+  4. 在 clique graph 上做连通分量 → 社区
 输出：每个社区 = 一个记忆分组
 ```
 
@@ -116,24 +118,15 @@ return sorted(results, key=-score)[:top_k]
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `k` | 3 | 团大小（仅支持 k=3，即三角形） |
-| `threshold` | 0.8 | 余弦相似度阈值 |
+| `k` | 4 (config: `group_k`) | 团大小，支持任意 k≥2 |
+| `threshold` | 0.45 (config: `group_threshold`) | 余弦相似度阈值 |
 | 重叠 | 允许 | 一条记忆可属于多个分组 |
 
-### 存储
-
-```sql
-CREATE TABLE memory_groups (
-    id               TEXT PRIMARY KEY,
-    entry_ids        TEXT NOT NULL DEFAULT '[]',  -- JSON 数组
-    member_count     INTEGER DEFAULT 0,
-    create_timestamp INTEGER NOT NULL
-);
-```
+**参数持久化**：写入 config 表，重启自动读取。
 
 ### 启动构建
 
-`_ensure_init()` 末尾自动调用 `build_groups(k=3, threshold=0.8)`。
+`_ensure_init()` 末尾从 config 表读取 `group_k` 和 `group_threshold`，自动调用 `build_groups(k=k, threshold=threshold)`。
 新条目写入后需要手动调用 `memory_rebuild_groups` 重新构建。
 
 ---
@@ -233,8 +226,9 @@ memory_write_context(timeline_id: str, context_text: str) -> str
 
 ```
 memory_get_groups(entry_id: str) -> str
+memory_list_groups() -> str                        # 列出所有分组
 memory_get_group_members(group_id: str) -> str
-memory_rebuild_groups(threshold: float = 0.8) -> str
+memory_rebuild_groups(threshold: float = 0.45) -> str  # 从 config 读 k，threshold 可选覆盖
 ```
 
 ### 状态
@@ -257,7 +251,8 @@ _ensure_init() [延迟初始化，首次工具调用时触发]
   3. 迁移 config 表（2列 → 6列）+ 写入默认值
   4. 迁移 human_timeline 表（补 category/is_time_sensitive；v7 重建去死字段）
   5. 初始化 VectorAdapter（加载 sentence-transformers 模型 + 已有向量）
-  6. 构建 CPM 分组（build_groups k=3 threshold=0.8）
+  6. 从 config 读取 `group_k` 和 `group_threshold`，构建 CPM 分组
+     （`build_groups(k=group_k, threshold=group_threshold)`）
 ```
 
 ### 线程安全
@@ -294,10 +289,10 @@ VellumMemError (Exception)
 ```
 vellum/
 ├── __init__.py               # 版本号
-├── server.py                 # MCP 入口 + @mcp.tool() × 9 + @_tool 装饰器
+├── server.py                 # MCP 入口 + @mcp.tool() × 10 + @_tool 装饰器
 ├── db.py                     # SQLite 连接 + Schema 初始化 + 迁移
 ├── errors.py                 # 异常层次（VellumMemError 基类）
-├── groups.py                 # CPM k=3 分组管理器
+├── groups.py                 # CPM 分组管理器（支持任意 k）
 ├── stores/
 │   ├── __init__.py
 │   └── human_timeline.py     # 人类记忆 CRUD + 上下文分片

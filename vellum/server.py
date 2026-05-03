@@ -94,8 +94,18 @@ def _ensure_init():
             ht = HumanTimelineStore(tmp_db)
             stores = {"human_timeline": ht}
             grp = GroupManager(tmp_db, vector)
-            result = grp.build_groups(k=3, threshold=0.8)
-            _log_call(f"   groups built: {result.get('groups_built', 0)}")
+            # 从 config 表读取分组参数
+            cfg = tmp_db.connect()
+            row_th = cfg.execute(
+                "SELECT value FROM config WHERE key = ?", ("group_threshold",)
+            ).fetchone()
+            group_threshold = float(row_th["value"]) if row_th else 0.45
+            row_k = cfg.execute(
+                "SELECT value FROM config WHERE key = ?", ("group_k",)
+            ).fetchone()
+            group_k = int(row_k["value"]) if row_k else 4
+            result = grp.build_groups(k=group_k, threshold=group_threshold)
+            _log_call(f"   k={group_k} th={group_threshold} → {result.get('groups_built', 0)} groups")
 
             _db = tmp_db
             _vector = vector
@@ -103,6 +113,16 @@ def _ensure_init():
             _groups = grp
 
             _log_call("INIT ✅ Initialization complete")
+
+            # Cleanup expired time-sensitive entries
+            try:
+                removed = _stores["human_timeline"].cleanup_expired()
+                if removed:
+                    for eid in ...:
+                        _vector.remove(eid)
+            except Exception:
+                pass
+
         except Exception:
             _db = _vector = _stores = _groups = None
             import traceback
@@ -145,7 +165,8 @@ def memory_query(query: str, top_k: int = 3,
     Returns:
         {"results": [QueryResult...]}
         每个 QueryResult 包含 source_id, summary, score,
-        create_timestamp, has_context, context_link, total_chunks 等字段。
+        create_timestamp, has_context, context_link, total_chunks,
+        category, is_time_sensitive, group_ids 等字段。
     """
     hits = _vector.search(query, top_k=top_k, score_threshold=score_threshold)
     results = []
@@ -155,6 +176,8 @@ def memory_query(query: str, top_k: int = 3,
         if not entry:
             continue
         link = entry.get("conversation_context_link", [])
+        # 查分组
+        entry_groups = _groups.get_groups_for_entry(eid)
         results.append({
             "source_id": eid,
             "summary": entry.get("summary", "")[:200],
@@ -165,6 +188,7 @@ def memory_query(query: str, top_k: int = 3,
             "total_chunks": len(link),
             "category": entry.get("category", "conversation"),
             "is_time_sensitive": bool(entry.get("is_time_sensitive", 0)),
+            "group_ids": [g["id"] for g in entry_groups],
         })
 
     return json.dumps({"results": results}, ensure_ascii=False, default=str)
@@ -305,6 +329,95 @@ def memory_status() -> str:
     return json.dumps({"storage": stats})
 
 
+# ── Delete / Update Tools ─────────────────────────────────────
+
+
+@mcp.tool()
+@_tool
+def memory_delete(entry_id: str, force: bool = False) -> str:
+    """删除记忆条目。
+
+    不会删除 is_time_sensitive=True 的条目（除非 force=True）。
+    time-sensitive 条目会在 TTL 到期后自动清理。
+
+    Args:
+        entry_id: human_timeline 条目 ID
+        force: 是否强制删除 time-sensitive 条目（默认 False）
+
+    Returns:
+        {"message": "Memory deleted", "id": str} 或 {"error": ...}
+    """
+    entry = _stores["human_timeline"].get_by_id(entry_id)
+    if not entry:
+        return json.dumps({"error": f"Entry {entry_id} not found"})
+    if entry.get("is_time_sensitive") and not force:
+        return json.dumps({
+            "error": f"Entry {entry_id} is time-sensitive and cannot be manually deleted. "
+                     "Use force=True to override, or wait for TTL auto-cleanup."
+        })
+    ht = _stores["human_timeline"]
+    ok = ht.delete(entry_id)
+    if not ok:
+        return json.dumps({"error": f"Failed to delete {entry_id}"})
+    _vector.remove(entry_id)
+    return json.dumps({"message": "Memory deleted", "id": entry_id}, ensure_ascii=False)
+
+
+@mcp.tool()
+@_tool
+def memory_update(entry_id: str, data: str) -> str:
+    """更新记忆条目。
+
+    支持部分字段更新。如果 summary 或 tags 变化，自动重新计算合并向量。
+    如果提供 context_text，替换所有已有上下文分片（不追加）。
+
+    Args:
+        entry_id: human_timeline 条目 ID
+        data: JSON 字符串，可选字段：
+            - summary: str
+            - tags: [str]（必须提供 5 个）
+            - category: str
+            - is_time_sensitive: bool
+            - context_text: str（替换全部原文）
+
+    Returns:
+        {"message": "Memory updated", "id": str, "context_ids": [str]}
+    """
+    try:
+        payload = json.loads(data) if isinstance(data, str) else data
+    except json.JSONDecodeError:
+        return json.dumps({"error": "Invalid JSON data"})
+
+    ht = _stores["human_timeline"]
+    result = ht.update(
+        entry_id,
+        summary=payload.get("summary"),
+        tags=payload.get("tags"),
+        category=payload.get("category"),
+        is_time_sensitive=payload.get("is_time_sensitive"),
+        context_text=payload.get("context_text"),
+    )
+    if "error" in result:
+        return json.dumps(result)
+
+    if result.get("vector_changed") and _vector:
+        entry = ht.get_by_id(entry_id)
+        if entry:
+            try:
+                tags_raw = entry.get("tags", []) or []
+                if isinstance(tags_raw, str):
+                    tags_raw = json.loads(tags_raw)
+                _vector.store(entry_id, entry.get("summary", ""), tags_raw)
+            except Exception:
+                pass
+
+    return json.dumps({
+        "message": "Memory updated",
+        "id": result["id"],
+        "context_ids": result.get("context_ids", []),
+    }, ensure_ascii=False)
+
+
 # ── Group Tools ────────────────────────────────────────────────
 
 @mcp.tool()
@@ -320,6 +433,18 @@ def memory_get_groups(entry_id: str) -> str:
     """
     groups = _groups.get_groups_for_entry(entry_id)
     return json.dumps({"entry_id": entry_id, "groups": groups}, ensure_ascii=False)
+
+
+@mcp.tool()
+@_tool
+def memory_list_groups() -> str:
+    """列出所有记忆分组。
+
+    Returns:
+        {"groups": [{"id": str, "member_count": int, "entry_ids": [str], "create_timestamp": int}]}
+    """
+    groups = _groups.list_groups()
+    return json.dumps({"groups": groups}, ensure_ascii=False, default=str)
 
 
 @mcp.tool()
@@ -341,19 +466,24 @@ def memory_get_group_members(group_id: str) -> str:
 
 @mcp.tool()
 @_tool
-def memory_rebuild_groups(threshold: float = 0.8) -> str:
-    """重新构建记忆分组（CPM k=3）。
+def memory_rebuild_groups(threshold: float = 0.45) -> str:
+    """重新构建记忆分组（CPM，支持任意 k 值）。
 
     基于所有记忆的向量余弦相似度，用派系过滤法重新计算分组。
+    k 值从 config 表读取（group_k），threshold 可手动覆盖。
     已有分组会被替换。
 
     Args:
-        threshold: 余弦相似度阈值（默认 0.8）
+        threshold: 余弦相似度阈值（默认 0.45）
 
     Returns:
         {"groups_built": int, "entries": int}
     """
-    result = _groups.build_groups(k=3, threshold=threshold)
+    k_row = _db.connect().execute(
+        "SELECT value FROM config WHERE key = ?", ("group_k",)
+    ).fetchone()
+    k = int(k_row["value"]) if k_row else 4
+    result = _groups.build_groups(k=k, threshold=threshold)
     return json.dumps(result)
 
 

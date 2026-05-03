@@ -115,7 +115,8 @@ class HumanTimelineStore:
                tags: list | None = None,
                context_text: str | None = None,
                category: str,
-               is_time_sensitive: bool = False) -> dict:
+               is_time_sensitive: bool = False,
+               ttl_timestamp: int | None = None) -> dict:
         """创建一条 human_timeline 记录。
 
         Args:
@@ -124,6 +125,7 @@ class HumanTimelineStore:
             context_text: 初始上下文原文
             category: 记忆类型（conversation/knowledge/document/preference/other）
             is_time_sensitive: 内容是否随时间可能失效
+            ttl_timestamp: 可选，过期时间戳（ms）。is_time_sensitive=True 且未传时自动计算
 
         Raises:
             ValueError: tags 不足 5 个时抛出
@@ -144,19 +146,25 @@ class HumanTimelineStore:
         hid = _next_human_id()
         now = _now_ms()
 
+        # 自动计算 TTL
+        if is_time_sensitive and ttl_timestamp is None:
+            import os as _os
+            days = int(_os.environ.get("VELLUM_DEFAULT_TTL_DAYS", "3"))
+            ttl_timestamp = now + days * 86400 * 1000
+
         conn = self.db.connect()
         conn.execute("""
             INSERT INTO human_timeline
                 (id, summary, tags, conversation_context_link,
-                 category, is_time_sensitive, create_timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                 category, is_time_sensitive, create_timestamp, ttl_timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             hid,
             (summary or "")[:200],
             json.dumps(tags, ensure_ascii=False),
             "[]",
             category, int(is_time_sensitive),
-            now,
+            now, ttl_timestamp,
         ))
         conn.commit()
 
@@ -256,3 +264,134 @@ class HumanTimelineStore:
         result_map = {r["id"]: dict(r) for r in rows}
         # 保持 selected 顺序
         return [result_map[cid] for cid in selected if cid in result_map]
+
+    # ── 删除 ──────────────────────────────────────────────────
+
+    def delete(self, entry_id: str) -> bool:
+        """删除一条记忆（级联清除上下文 + 向量）。同时从分组中移除。"""
+        conn = self.db.connect()
+        entry = _row_to_dict(conn.execute(
+            "SELECT id FROM human_timeline WHERE id = ?", (entry_id,)
+        ).fetchone())
+        if not entry:
+            return False
+
+        # 从 memory_groups 移除
+        self._remove_from_groups(conn, entry_id)
+
+        # 删除（级联到 conversation_context + entry_vectors）
+        conn.execute("DELETE FROM human_timeline WHERE id = ?", (entry_id,))
+        conn.commit()
+        return True
+
+    # ── 更新 ──────────────────────────────────────────────────
+
+    def update(self, entry_id: str, *, summary: str | None = None,
+               tags: list | None = None,
+               category: str | None = None,
+               is_time_sensitive: bool | None = None,
+               context_text: str | None = None) -> dict:
+        """更新一条记忆的部分字段。返回更新结果及 vector_changed 标志。
+
+        Returns:
+            {"id": str, "context_ids": [str], "vector_changed": bool}
+            或 {"error": str}
+        """
+        entry = self.get_by_id(entry_id)
+        if not entry:
+            return {"error": f"Timeline {entry_id} not found"}
+
+        import os as _os
+        sets: list[str] = []
+        params: list = []
+        now = _now_ms()
+        vector_changed = False
+
+        if summary is not None:
+            sets.append("summary = ?")
+            params.append(summary[:200])
+            vector_changed = True
+        if tags is not None:
+            if len(tags) != 5:
+                return {"error": "tags must be exactly 5"}
+            sets.append("tags = ?")
+            params.append(json.dumps(tags, ensure_ascii=False))
+            vector_changed = True
+        if category is not None:
+            valid = {"conversation", "knowledge", "document", "preference", "other"}
+            if category not in valid:
+                return {"error": f"invalid category: {category}"}
+            sets.append("category = ?")
+            params.append(category)
+        if is_time_sensitive is not None:
+            sets.append("is_time_sensitive = ?")
+            params.append(int(is_time_sensitive))
+            if is_time_sensitive:
+                days = int(_os.environ.get("VELLUM_DEFAULT_TTL_DAYS", "3"))
+                sets.append("ttl_timestamp = ?")
+                params.append(now + days * 86400 * 1000)
+            else:
+                sets.append("ttl_timestamp = ?")
+                params.append(None)
+
+        ctx_ids: list[str] = []
+        if context_text is not None:
+            conn = self.db.connect()
+            # 清旧分片
+            conn.execute("DELETE FROM conversation_context WHERE timeline_id = ?", (entry_id,))
+            # 写新分片
+            ctx_ids = self._write_context_chunks(conn, context_text, entry_id)
+            sets.append("conversation_context_link = ?")
+            params.append(json.dumps(ctx_ids, ensure_ascii=False))
+
+        if not sets:
+            return {"id": entry_id, "context_ids": ctx_ids, "vector_changed": False}
+
+        params.append(entry_id)
+        conn = self.db.connect()
+        conn.execute(
+            f"UPDATE human_timeline SET {', '.join(sets)} WHERE id = ?",
+            params
+        )
+        conn.commit()
+        return {"id": entry_id, "context_ids": ctx_ids, "vector_changed": vector_changed}
+
+    # ── TTL 清理 ──────────────────────────────────────────────
+
+    def cleanup_expired(self) -> int:
+        """删除所有已过期的 time-sensitive 条目。返回删除数量。"""
+        conn = self.db.connect()
+        now = _now_ms()
+        expired = conn.execute(
+            "SELECT id FROM human_timeline WHERE ttl_timestamp IS NOT NULL AND ttl_timestamp <= ?",
+            (now,)
+        ).fetchall()
+        ids = [r["id"] for r in expired]
+        if not ids:
+            return 0
+        for eid in ids:
+            self._remove_from_groups(conn, eid)
+            conn.execute("DELETE FROM human_timeline WHERE id = ?", (eid,))
+        conn.commit()
+        import sys as _sys
+        _sys.stderr.write(f"[VellumMem] cleanup: removed {len(ids)} expired entries\n")
+        _sys.stderr.flush()
+        return len(ids)
+
+    # ── 内部工具 ──────────────────────────────────────────────
+
+    @staticmethod
+    def _remove_from_groups(conn, entry_id: str):
+        """从所有分组的 entry_ids 中移除 entry_id。"""
+        groups = conn.execute("SELECT * FROM memory_groups").fetchall()
+        for g in groups:
+            members = json.loads(g["entry_ids"])
+            if entry_id in members:
+                members.remove(entry_id)
+                if members:
+                    conn.execute(
+                        "UPDATE memory_groups SET entry_ids = ?, member_count = ? WHERE id = ?",
+                        (json.dumps(members, ensure_ascii=False), len(members), g["id"])
+                    )
+                else:
+                    conn.execute("DELETE FROM memory_groups WHERE id = ?", (g["id"],))

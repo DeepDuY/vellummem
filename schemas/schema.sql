@@ -40,7 +40,8 @@ CREATE TABLE IF NOT EXISTS human_timeline (
     conversation_context_link TEXT DEFAULT '[]',
     category                  TEXT DEFAULT 'conversation',
     is_time_sensitive         INTEGER DEFAULT 0,
-    create_timestamp          INTEGER NOT NULL
+    create_timestamp          INTEGER NOT NULL,
+    ttl_timestamp             INTEGER DEFAULT NULL
 );
 
 CREATE TABLE IF NOT EXISTS conversation_context (

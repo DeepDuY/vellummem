@@ -165,6 +165,11 @@ class VectorAdapter:
         )
         conn.commit()
 
+    def remove(self, entry_id: str):
+        """Remove a vector from in-memory cache (DB delete handled by FK cascade)."""
+        self._vectors.pop(entry_id, None)
+        self._corpus = [c for c in self._corpus if c["id"] != entry_id]
+
     def search(self, query: str, top_k: int = 3,
                score_threshold: float = 0.15) -> list[dict]:
         """Find semantically similar entries via merged vector dot products."""

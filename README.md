@@ -15,7 +15,7 @@ VellumMem is an MCP server that gives AI assistants **persistent, searchable mem
 | Capability | How It Works |
 |-----------|--------------|
 | **Human Memory** 🧠 | Store conversation summaries + tags + full context; search via semantic vectors |
-| **Memory Grouping** | Automatic grouping of related memories via CPM (k=3) |
+| **Memory Grouping** | Automatic grouping of related memories via CPM (k=4, configurable) |
 | **Pre-merged Vector** | 1 vector per entry (vs 6), mathematically identical to multi-vector scoring |
 
 **Key differentiators:**
@@ -70,7 +70,7 @@ memory_write(data: str) -> str
 ```
 memory_query(query, top_k=3, score_threshold=0.15) -> str
 ```
-Returns entries sorted by cosine similarity (real 0–1 score). Each result includes `create_timestamp`.
+Returns entries sorted by cosine similarity (real 0–1 score). Each result includes `create_timestamp`, `category`, `is_time_sensitive`, `group_ids`.
 
 ### Context Management
 
@@ -84,9 +84,11 @@ Auto-chunked at natural boundaries (headings, code blocks, lists, paragraphs), m
 
 ```
 memory_get_groups(entry_id) -> str
+memory_list_groups() -> str
 memory_get_group_members(group_id) -> str
-memory_rebuild_groups(threshold=0.8) -> str
+memory_rebuild_groups(threshold=0.45) -> str
 ```
+`memory_rebuild_groups` reads `k` from config (`group_k`), threshold is optional override.
 
 ### Status
 
@@ -134,10 +136,10 @@ All tools return JSON errors on failure (not raw tracebacks), thanks to the `@_t
 
 | Component | File | Responsibility |
 |-----------|------|----------------|
-| Server | `server.py` | MCP entry, 9 tools, `@_tool` decorator |
+| Server | `server.py` | MCP entry, 10 tools, `@_tool` decorator |
 | Database | `db.py` | SQLite wrapper, schema init |
 | Human Timeline | `stores/human_timeline.py` | Memory CRUD + context chunking |
-| Group Manager | `groups.py` | CPM k=3 memory grouping |
+| Group Manager | `groups.py` | CPM k=4 memory grouping (configurable) |
 | Vector Adapter | `vector/adapter.py` | Sentence-transformers, pre-merged vectors |
 | Exceptions | `errors.py` | VellumMemError hierarchy |
 
@@ -161,12 +163,15 @@ score = (q·s + q·t₀ + ... + q·t₄) / 6  =  q · (s + t₀ + ... + t₄) / 
 | Dot products | 6000 | **1000** |
 | Query time (1K) | ~147ms | **~38ms** |
 
-### Memory Grouping (CPM k=3)
+### Memory Grouping (CPM k=4, configurable)
 
 1. Pairwise cosine similarity ≥ threshold → edges
-2. Find all triangles (3-cliques)
-3. Triangles sharing an edge → same community
+2. Find all k-cliques (extended bottom-up: edges → 3-cliques → ... → k-cliques)
+3. k-cliques sharing k-1 nodes → same community
 4. Connected components → groups
+
+**`k` and `threshold` read from config (`group_k`, `group_threshold`).**
+Auto-built at startup; override via `memory_rebuild_groups()`.
 
 ---
 
@@ -178,7 +183,7 @@ vellum/
 ├── server.py                 # MCP entry + 9 tools + @_tool
 ├── db.py                     # SQLite + init
 ├── errors.py                 # exception hierarchy
-├── groups.py                 # CPM k=3 grouping
+├── groups.py                 # CPM grouping (configurable k)
 ├── stores/
 │   ├── __init__.py
 │   └── human_timeline.py     # memory CRUD + chunking
