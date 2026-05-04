@@ -114,20 +114,83 @@ def _ensure_init():
 
             _log_call("INIT ✅ Initialization complete")
 
-            # Cleanup expired time-sensitive entries
-            try:
-                removed = _stores["human_timeline"].cleanup_expired()
-                if removed:
-                    for eid in ...:
-                        _vector.remove(eid)
-            except Exception:
-                pass
-
         except Exception:
             _db = _vector = _stores = _groups = None
             import traceback
             traceback.print_exc()
             _log_call("INIT ❌ FAILED")
+
+
+def _read_config(key: str, default: str = "") -> str:
+    """从 config 表读取配置值（环境变量优先）。"""
+    env_key = f"VELLUM_{key.upper()}"
+    env_val = os.environ.get(env_key)
+    if env_val is not None:
+        return env_val
+    try:
+        row = _db.connect().execute(
+            "SELECT value FROM config WHERE key = ?", (key,)
+        ).fetchone()
+        return row["value"] if row else default
+    except Exception:
+        return default
+
+
+def _start_daemon():
+    """启动后台守护线程：定时 TTL 清理 + 去重扫描。"""
+    import sys as _sys
+    import time as _time
+
+    def _loop():
+        while True:
+            interval = int(float(_read_config("daemon_interval", "1800")))
+            _time.sleep(interval)
+
+            try:
+                # ── 1. TTL 清理 ──
+                conn = _db.connect()
+                now = int(__import__("time").time() * 1000)
+                expired = conn.execute(
+                    "SELECT id FROM human_timeline "
+                    "WHERE ttl_timestamp IS NOT NULL AND ttl_timestamp <= ?",
+                    (now,)
+                ).fetchall()
+                expired_ids = [r["id"] for r in expired]
+                if expired_ids:
+                    removed = _stores["human_timeline"].cleanup_expired()
+                    if removed > 0 and _vector:
+                        for eid in expired_ids:
+                            _vector.remove(eid)
+                    _sys.stderr.write(
+                        f"[VellumMem Daemon] cleanup: removed {removed} expired entries\n"
+                    )
+                    _sys.stderr.flush()
+            except Exception as e:
+                _sys.stderr.write(f"[VellumMem Daemon] cleanup error: {e}\n")
+                _sys.stderr.flush()
+
+            try:
+                # ── 2. 去重扫描 ──
+                enable = _read_config("dedup_enable", "false")
+                if enable.lower() == "true" and _vector:
+                    threshold = float(_read_config("dedup_threshold", "0.9"))
+                    skip = _stores["human_timeline"].get_time_sensitive_ids()
+                    dupes = _vector.scan_duplicates(threshold=threshold, skip_ids=skip)
+                    for d in dupes:
+                        _stores["human_timeline"].mark_as_time_sensitive(d["duplicate"])
+                        _sys.stderr.write(
+                            f"[VellumMem Daemon] dedup: {d['duplicate']} ~ "
+                            f"{d['keeper']} ({d['score']})\n"
+                        )
+                        _sys.stderr.flush()
+            except Exception as e:
+                _sys.stderr.write(f"[VellumMem Daemon] dedup error: {e}\n")
+                _sys.stderr.flush()
+
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
+    _sys.stderr.write("[VellumMem Daemon] started\n")
+    _sys.stderr.flush()
 
 
 # ── MCP Server ────────────────────────────────────────────────
@@ -492,9 +555,8 @@ def memory_rebuild_groups(threshold: float = 0.45) -> str:
 def main():
     """Start VellumMem MCP server over stdio transport.
 
-    Pre-warms sentence-transformers synchronously before the server
-    starts accepting connections, so the first tool call is never
-    delayed by a cold import.
+    Pre-warms sentence-transformers, initializes stores & vectors,
+    starts the background daemon thread, then runs the MCP server.
     """
     import sys as _sys
     try:
@@ -509,4 +571,11 @@ def main():
     except Exception:
         _sys.stderr.write("[VellumMem]   sentence-transformers pre-warm failed\n")
         _sys.stderr.flush()
+
+    # 主动初始化（DB、向量模型、分组）
+    _ensure_init()
+
+    # 启动后台守护线程（TTL 清理 + 去重扫描）
+    _start_daemon()
+
     mcp.run()

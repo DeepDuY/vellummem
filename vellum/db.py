@@ -43,6 +43,7 @@ class VellumDB:
         conn.commit()
         self._migrate_config()
         self._migrate_human_timeline()
+        self._migrate_entry_vectors()
 
     def _migrate_config(self):
         """Upgrade config table from old 2-column to new 6-column schema;
@@ -80,6 +81,9 @@ class VellumDB:
             ("score_threshold",   "0.15",        "float", "向量检索最低匹配分数"),
             ("group_threshold",   "0.45",        "float", "记忆分组余弦相似度阈值"),
             ("group_k",           "4",           "int",   "CPM 分组 k 值"),
+            ("dedup_enable",      "false",       "bool",  "启用后台去重扫描"),
+            ("dedup_threshold",   "0.9",         "float", "去重扫描余弦相似度阈值"),
+            ("daemon_interval",   "1800",        "int",   "守护线程扫描间隔（秒）"),
         ]
         conn.executemany(
             "INSERT OR IGNORE INTO config (key, value, type, description) VALUES (?, ?, ?, ?)",
@@ -132,6 +136,16 @@ class VellumDB:
         if "ttl_timestamp" not in existing:
             conn.execute("ALTER TABLE human_timeline ADD COLUMN ttl_timestamp INTEGER DEFAULT NULL")
         conn.commit()
+
+    def _migrate_entry_vectors(self):
+        """Add summary_blob column to entry_vectors if missing."""
+        conn = self.connect()
+        cols = [r["name"] for r in conn.execute(
+            "PRAGMA table_info(entry_vectors)"
+        ).fetchall()]
+        if "summary_blob" not in cols:
+            conn.execute("ALTER TABLE entry_vectors ADD COLUMN summary_blob BLOB")
+            conn.commit()
 
     # ── Helpers ────────────────────────────────────────────────
 

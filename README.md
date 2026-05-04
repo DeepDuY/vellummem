@@ -16,6 +16,7 @@ VellumMem is an MCP server that gives AI assistants **persistent, searchable mem
 |-----------|--------------|
 | **Human Memory** 🧠 | Store conversation summaries + tags + full context; search via semantic vectors |
 | **Memory Grouping** | Automatic grouping of related memories via CPM (k=4, configurable) |
+| **Background Daemon** | Periodic TTL cleanup + optional automatic dedup scanning |
 | **Pre-merged Vector** | 1 vector per entry (vs 6), mathematically identical to multi-vector scoring |
 
 **Key differentiators:**
@@ -175,21 +176,45 @@ Auto-built at startup; override via `memory_rebuild_groups()`.
 
 ---
 
+## Background Daemon
+
+VellumMem starts a background daemon thread at startup (`_start_daemon()`), which periodically:
+
+| Task | Default Interval | Config Key | Env Var |
+|------|-----------------|-----------|---------|
+| **TTL Cleanup** | 30 min | `daemon_interval` | `VELLUM_DAEMON_INTERVAL` |
+| **Dedup Scan** | 30 min (same interval) | `dedup_enable` + `dedup_threshold` | `VELLUM_DEDUP_ENABLE` + `VELLUM_DEDUP_THRESHOLD` |
+
+### Dedup Scan
+
+When enabled, the daemon compares all entries' **summary vectors** (cosine similarity ≥ `dedup_threshold`, default 0.9):
+- Skips entries already marked `is_time_sensitive=true`
+- For each duplicate pair: marks the newer entry as `is_time_sensitive=true` with default 3-day TTL
+- The background TTL cleanup automatically removes flagged duplicates
+
+To enable:
+```bash
+set VELLUM_DEDUP_ENABLE=true
+# Or via SQL: INSERT OR REPLACE INTO config (key, value) VALUES ('dedup_enable', 'true');
+```
+
+---
+
 ## Project Structure
 
 ```
 vellum/
 ├── __init__.py               # version
-├── server.py                 # MCP entry + 9 tools + @_tool
-├── db.py                     # SQLite + init
+├── server.py                 # MCP entry + 10 tools + @_tool + daemon thread
+├── db.py                     # SQLite + init + migrations
 ├── errors.py                 # exception hierarchy
 ├── groups.py                 # CPM grouping (configurable k)
 ├── stores/
 │   ├── __init__.py
-│   └── human_timeline.py     # memory CRUD + chunking
+│   └── human_timeline.py     # memory CRUD + chunking + dedup helpers
 └── vector/
     ├── __init__.py
-    └── adapter.py            # transformer wrapper + pre-merged vectors
+    └── adapter.py            # transformer wrapper + pre-merged vectors + summary vectors
 schemas/
 └── schema.sql
 tests/
@@ -206,6 +231,10 @@ tests/
 |----------|---------|-------------|
 | `VELLUM_DB_PATH` | `vellum/vellum.db` | Absolute path to SQLite file |
 | `VELLUM_TRANSFORMER_MODEL` | `BAAI/bge-small-zh-v1.5` | Sentence-transformer model name |
+| `VELLUM_DEDUP_ENABLE` | `false` | Enable background dedup scanning |
+| `VELLUM_DEDUP_THRESHOLD` | `0.9` | Cosine similarity threshold for dedup |
+| `VELLUM_DAEMON_INTERVAL` | `1800` | Daemon loop interval in seconds |
+| `VELLUM_DEFAULT_TTL_DAYS` | `3` | Default TTL for time-sensitive entries |
 
 ---
 

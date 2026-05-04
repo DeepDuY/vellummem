@@ -378,6 +378,33 @@ class HumanTimelineStore:
         _sys.stderr.flush()
         return len(ids)
 
+    # ── 去重辅助 ────────────────────────────────────────────────
+
+    def get_time_sensitive_ids(self) -> set[str]:
+        """返回所有标记为 time_sensitive 且尚未过期的 entry_id 集合。"""
+        conn = self.db.connect()
+        now = _now_ms()
+        rows = conn.execute(
+            "SELECT id FROM human_timeline "
+            "WHERE is_time_sensitive = 1 "
+            "AND (ttl_timestamp IS NULL OR ttl_timestamp > ?)",
+            (now,)
+        ).fetchall()
+        return {r["id"] for r in rows}
+
+    def mark_as_time_sensitive(self, entry_id: str) -> bool:
+        """将指定条目标记为 time_sensitive 并设置 TTL。"""
+        import os as _os
+        days = int(_os.environ.get("VELLUM_DEFAULT_TTL_DAYS", "3"))
+        ttl = _now_ms() + days * 86400 * 1000
+        conn = self.db.connect()
+        conn.execute(
+            "UPDATE human_timeline SET is_time_sensitive = 1, ttl_timestamp = ? WHERE id = ?",
+            (ttl, entry_id)
+        )
+        conn.commit()
+        return True
+
     # ── 内部工具 ──────────────────────────────────────────────
 
     @staticmethod

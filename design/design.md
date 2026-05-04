@@ -1,9 +1,10 @@
-# VellumMem — 设计文档 v7 (v1.2)
+# VellumMem — 设计文档 v8 (v1.3)
 
 > 状态：已实装 ✅
 > 内核：Human-only 纯记忆系统
 > 检索：预合并向量（1 向量/条）
 > 分组：Clique Percolation Method (CPM, 支持任意 k，默认 4)
+> 后台：守护线程（TTL 清理 + 去重扫描）
 
 ---
 
@@ -131,7 +132,7 @@ return sorted(results, key=-score)[:top_k]
 
 ---
 
-## 四、数据库 Schema v7
+## 四、数据库 Schema v8
 
 ### human_timeline（核心表）
 
@@ -164,8 +165,9 @@ CREATE TABLE conversation_context (
 
 ```sql
 CREATE TABLE entry_vectors (
-    entry_id    TEXT PRIMARY KEY REFERENCES human_timeline(id) ON DELETE CASCADE,
-    merged_blob BLOB NOT NULL    -- pickle.dumps(np.ndarray(float32, 512))
+    entry_id     TEXT PRIMARY KEY REFERENCES human_timeline(id) ON DELETE CASCADE,
+    merged_blob  BLOB NOT NULL,       -- pickle.dumps(np.ndarray(float32, 512))  合并向量
+    summary_blob BLOB                 -- pickle.dumps(np.ndarray(float32, 512))  摘要向量（去重用）
 );
 ```
 
@@ -181,6 +183,19 @@ CREATE TABLE memory_groups (
 ```
 
 ### config
+> 默认键值（启动自动写入，`INSERT OR IGNORE`）：
+
+| key | value | type | 说明 |
+|-----|-------|------|------|
+| `vector_engine` | `transformer` | str | 向量引擎 |
+| `score_threshold` | `0.15` | float | 检索最低匹配分数 |
+| `group_threshold` | `0.45` | float | CPM 相似度阈值 |
+| `group_k` | `4` | int | CPM k 值 |
+| `dedup_enable` | `false` | bool | 后台去重扫描开关 |
+| `dedup_threshold` | `0.9` | float | 去重扫描余弦阈值 |
+| `daemon_interval` | `1800` | int | 守护线程扫描间隔（秒） |
+
+值读取优先级：环境变量 > config 表 > 代码默认值。
 
 ```sql
 CREATE TABLE config (
@@ -245,14 +260,19 @@ memory_status() -> str
 ### 初始化流程
 
 ```
-_ensure_init() [延迟初始化，首次工具调用时触发]
-  1. 解析数据库路径（VELLUM_DB_PATH 环境变量或默认）
-  2. 连接 SQLite + executescript schema.sql
-  3. 迁移 config 表（2列 → 6列）+ 写入默认值
-  4. 迁移 human_timeline 表（补 category/is_time_sensitive；v7 重建去死字段）
-  5. 初始化 VectorAdapter（加载 sentence-transformers 模型 + 已有向量）
-  6. 从 config 读取 `group_k` 和 `group_threshold`，构建 CPM 分组
-     （`build_groups(k=group_k, threshold=group_threshold)`）
+main()
+  1. 预热 sentence-transformers（同步 import，确保首次工具调用不卡）
+  2. 调用 _ensure_init()（强制初始化，非惰性）
+     2a. 解析数据库路径（VELLUM_DB_PATH 环境变量或默认）
+     2b. 连接 SQLite + executescript schema.sql
+     2c. 迁移 config 表（2列 → 6列）+ 写入默认值
+     2d. 迁移 human_timeline 表（补 category/is_time_sensitive；v7 重建去死字段）
+     2e. 迁移 entry_vectors 表（补 summary_blob 列）
+     2f. 初始化 VectorAdapter（加载 sentence-transformers 模型 + 已有向量）
+     2g. 从 config 读取 `group_k` 和 `group_threshold`，构建 CPM 分组
+         （`build_groups(k=group_k, threshold=group_threshold)`）
+  3. 启动守护线程（_start_daemon）
+  4. mcp.run()（阻塞，MCP 开始监听）
 ```
 
 ### 线程安全
@@ -284,21 +304,92 @@ VellumMemError (Exception)
 
 ---
 
-## 七、项目结构
+## 七、守护线程与去重扫描
+
+### 守护线程（Daemon Thread）
+
+`main()` 在 `_ensure_init()` 完成后、`mcp.run()` 之前启动一个 daemon 线程，周期执行后台任务。
+
+```
+main()
+├── _ensure_init()
+├── _start_daemon()         ← 启动守护线程
+│   └── daemon 循环:
+│       ├── sleep(interval)           ← 默认 1800 秒
+│       ├── TTL 清理                   ← 删除过期条目 + 移除向量缓存
+│       └── 去重扫描（开光后）          ← 摘要向量 O(N²) 比对
+└── mcp.run()
+```
+
+### 调度机制
+
+- 线程循环一次 `sleep(interval)` → 依次执行任务 → 再次 sleep
+- `interval` 读取自 config 表 `daemon_interval`（默认 1800s=30min）
+- 环境变量 `VELLUM_DAEMON_INTERVAL` 可覆盖 config 值
+- 所有异常被捕获并写入 stderr，不影响后续循环
+
+### TTL 清理
+
+- 之前：`_ensure_init()` 末尾一次性执行
+- 现在：守护线程定时执行 `cleanup_expired()`
+- 提前获取过期 ID → 清理 entries → 移除向量缓存
+- 每轮清理后会写 stderr 日志
+
+### 去重扫描
+
+**目标**：发现语义重复的记忆条目（如同一件事被反复记录）。
+
+**方法**：
+- `VectorAdapter.scan_duplicates(threshold, skip_ids)` — 全库 O(N²) 摘要向量余弦比对
+- 只比较 `_summary_vectors` 中存在的条目（摘要非空）
+- 跳过已标记 `is_time_sensitive=1` 的条目（即将过期，不必再比）
+
+**阈值**：`dedup_threshold`（默认 0.9），环境变量 `VELLUM_DEDUP_THRESHOLD` 可覆盖。
+
+**发现重复后的处理**：
+1. 比较两条条目的 `create_timestamp`
+2. 保留时间更早的（keeper），标记时间更晚的（duplicate）为 `is_time_sensitive=true`
+3. TTL 使用默认 3 天（`VELLUM_DEFAULT_TTL_DAYS`），到期自动清理
+
+**开关**：`dedup_enable`（默认 false），环境变量 `VELLUM_DEDUP_ENABLE=true` 开启。
+
+### 摘要向量（summary_blob）
+
+`entry_vectors` 表新增 `summary_blob` 列，独立存储摘要的归一化向量：
+
+```python
+summary_vec = model.encode(summary, normalize_embeddings=True)  # 单位向量
+```
+
+- `store()` 时自动计算并存一份
+- 启动时 `initialize()` 自动回填历史数据的缺失摘要向量
+- 不使用预合并向量而是独立存一份的原因：去重需要纯摘要语义比对，标签的噪声会降低精度
+
+### 配置读取优先级
+
+```
+环境变量 VELLUM_<KEY> > config 表 > 代码默认值
+```
+
+由 `_read_config(key, default)` 统一处理。
+
+---
+
+## 八、项目结构
 
 ```
 vellum/
 ├── __init__.py               # 版本号
-├── server.py                 # MCP 入口 + @mcp.tool() × 10 + @_tool 装饰器
-├── db.py                     # SQLite 连接 + Schema 初始化 + 迁移
+├── server.py                 # MCP 入口 + @mcp.tool() × 10 + @_tool 装饰器 + 守护线程
+├── db.py                     # SQLite 连接 + Schema 初始化 + 迁移（含 entry_vectors 迁移）
 ├── errors.py                 # 异常层次（VellumMemError 基类）
 ├── groups.py                 # CPM 分组管理器（支持任意 k）
 ├── stores/
 │   ├── __init__.py
-│   └── human_timeline.py     # 人类记忆 CRUD + 上下文分片
+│   └── human_timeline.py     # 人类记忆 CRUD + 上下文分片 + 去重辅助（get_time_sensitive_ids / mark_as_time_sensitive）
 └── vector/
     ├── __init__.py
-    └── adapter.py            # sentence-transformers 适配器 + 预合并向量
+    └── adapter.py            # sentence-transformers 适配器 + 预合并向量 + 摘要向量（去重）
 schemas/
 └── schema.sql                # 统一建表 SQL（v7）
 tests/

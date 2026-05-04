@@ -53,8 +53,9 @@ CREATE TABLE IF NOT EXISTS conversation_context (
 );
 
 CREATE TABLE IF NOT EXISTS entry_vectors (
-    entry_id    TEXT PRIMARY KEY REFERENCES human_timeline(id) ON DELETE CASCADE,
-    merged_blob BLOB NOT NULL
+    entry_id     TEXT PRIMARY KEY REFERENCES human_timeline(id) ON DELETE CASCADE,
+    merged_blob  BLOB NOT NULL,
+    summary_blob BLOB
 );
 
 -- ── 记忆分组表（CPM k=3，启动时自动构建） ─────────────────

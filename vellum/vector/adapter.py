@@ -43,6 +43,7 @@ class VectorAdapter:
         self.db = db
         self._model = None
         self._vectors: dict[str, np.ndarray] = {}
+        self._summary_vectors: dict[str, np.ndarray] = {}
         self._corpus: list[dict] = []
 
     @property
@@ -100,19 +101,25 @@ class VectorAdapter:
         # Load corpus and vectors from DB
         conn = self.db.connect()
         rows = conn.execute(
-            "SELECT id, summary, tags FROM human_timeline "
+            "SELECT id, summary, tags, create_timestamp FROM human_timeline "
             "WHERE summary IS NOT NULL AND summary != ''"
         ).fetchall()
         vec_rows = conn.execute(
-            "SELECT entry_id, merged_blob FROM entry_vectors"
+            "SELECT entry_id, merged_blob, summary_blob FROM entry_vectors"
         ).fetchall()
 
         self._vectors = {}
+        self._summary_vectors = {}
         for vr in vec_rows:
             try:
                 self._vectors[vr["entry_id"]] = pickle.loads(vr["merged_blob"])
             except Exception:
                 pass
+            if vr["summary_blob"] is not None:
+                try:
+                    self._summary_vectors[vr["entry_id"]] = pickle.loads(vr["summary_blob"])
+                except Exception:
+                    pass
 
         self._corpus = []
         for r in rows:
@@ -120,6 +127,7 @@ class VectorAdapter:
                 "id": r["id"],
                 "summary": r["summary"],
                 "tags": r["tags"],
+                "create_timestamp": r["create_timestamp"],
             })
 
         # Compute vectors for entries without them
@@ -140,6 +148,21 @@ class VectorAdapter:
                 )
             conn.commit()
 
+        # Backfill missing summary vectors
+        need_sv = [
+            c for c in self._corpus
+            if c["id"] not in self._summary_vectors and c["summary"]
+        ]
+        if need_sv and self._model:
+            for item in need_sv:
+                sv = self._model.encode(item["summary"], normalize_embeddings=True)
+                self._summary_vectors[item["id"]] = sv
+                conn.execute(
+                    "UPDATE entry_vectors SET summary_blob = ? WHERE entry_id = ?",
+                    (pickle.dumps(sv), item["id"])
+                )
+            conn.commit()
+
     # ── Core API ────────────────────────────────────────────
 
     def encode_and_merge(self, summary: str, tags: list[str]) -> np.ndarray:
@@ -153,21 +176,34 @@ class VectorAdapter:
         return (sv + tv.sum(axis=0)) / 6.0
 
     def store(self, entry_id: str, summary: str, tags: list[str]):
-        """Compute merged vector and persist to SQLite."""
+        """Compute merged vector + summary vector and persist to SQLite."""
         vec = self.encode_and_merge(summary, tags)
+        sv = self._model.encode(summary, normalize_embeddings=True)
         self._vectors[entry_id] = vec
-        self._corpus = [c for c in self._corpus if c["id"] != entry_id]
-        self._corpus.append({"id": entry_id, "summary": summary, "tags": tags})
+        self._summary_vectors[entry_id] = sv
         conn = self.db.connect()
+        # 获取 create_timestamp
+        row = conn.execute(
+            "SELECT create_timestamp FROM human_timeline WHERE id = ?",
+            (entry_id,)
+        ).fetchone()
+        ts = row["create_timestamp"] if row else 0
+        self._corpus = [c for c in self._corpus if c["id"] != entry_id]
+        self._corpus.append({
+            "id": entry_id, "summary": summary, "tags": tags,
+            "create_timestamp": ts,
+        })
         conn.execute(
-            "INSERT OR REPLACE INTO entry_vectors (entry_id, merged_blob) VALUES (?, ?)",
-            (entry_id, pickle.dumps(vec))
+            "INSERT OR REPLACE INTO entry_vectors (entry_id, merged_blob, summary_blob) "
+            "VALUES (?, ?, ?)",
+            (entry_id, pickle.dumps(vec), pickle.dumps(sv))
         )
         conn.commit()
 
     def remove(self, entry_id: str):
-        """Remove a vector from in-memory cache (DB delete handled by FK cascade)."""
+        """Remove vectors from in-memory cache (DB delete handled by FK cascade)."""
         self._vectors.pop(entry_id, None)
+        self._summary_vectors.pop(entry_id, None)
         self._corpus = [c for c in self._corpus if c["id"] != entry_id]
 
     def search(self, query: str, top_k: int = 3,
@@ -191,3 +227,51 @@ class VectorAdapter:
             {"entry_id": sid, "score": round(s, 4), "method": "transformer"}
             for sid, s in scores[:top_k]
         ]
+
+    # ── 去重扫描 ──────────────────────────────────────────────────
+
+    def scan_duplicates(self, threshold: float = 0.9,
+                        skip_ids: set | None = None) -> list[dict]:
+        """扫描全库摘要向量，找出相似度超过阈值的重复条目对。
+
+        Args:
+            threshold: 余弦相似度阈值
+            skip_ids: 要跳过的 entry_id 集合（如已标记 time_sensitive 的）
+
+        Returns:
+            [{"duplicate": str, "keeper": str, "score": float}, ...]
+            duplicate 是创建时间更晚的（将被标记为过期），
+            keeper 是被保留的（创建时间更早）。
+        """
+        skip_ids = skip_ids or set()
+        if len(self._summary_vectors) < 2:
+            return []
+
+        entries = [
+            (c["id"], self._summary_vectors.get(c["id"]), c["create_timestamp"])
+            for c in self._corpus
+            if c["id"] in self._summary_vectors
+            and c["summary"]
+            and c["id"] not in skip_ids
+        ]
+        if len(entries) < 2:
+            return []
+
+        results = []
+        for i in range(len(entries)):
+            id_a, va, ts_a = entries[i]
+            for j in range(i + 1, len(entries)):
+                id_b, vb, ts_b = entries[j]
+                score = float(va @ vb)  # 点积 = 余弦（均为单位向量）
+                if score >= threshold:
+                    if ts_a >= ts_b:
+                        dup, keeper = id_a, id_b
+                    else:
+                        dup, keeper = id_b, id_a
+                    results.append({
+                        "duplicate": dup,
+                        "keeper": keeper,
+                        "score": round(score, 4),
+                    })
+
+        return results
