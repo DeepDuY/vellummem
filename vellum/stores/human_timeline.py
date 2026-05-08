@@ -10,6 +10,7 @@ Design:
 from __future__ import annotations
 
 import json
+import os
 import random
 import sqlite3
 import string
@@ -23,7 +24,7 @@ from ..errors import StoreError
 
 # ── 分隔符（按优先级从高到低） ────────────────────────────────
 
-CONTEXT_SEPARATORS = [
+_DEFAULT_CONTEXT_SEPARATORS = [
     "\n## ",
     "\n### ",
     "\n#### ",
@@ -42,7 +43,9 @@ CONTEXT_SEPARATORS = [
     " ",
 ]
 
-CHUNK_SIZE = 8000  # 单片字符上限
+# ── 默认值 ─────────────────────────────────────────────────────
+
+_DEFAULT_CHUNK_SIZE = 1800  # 单片字符上限，可通过 config 表或 VELLUM_CHUNK_SIZE 环境变量覆盖
 
 
 # ── 工具函数 ──────────────────────────────────────────────────
@@ -58,20 +61,22 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def chunk_text(text: str) -> list[str]:
-    """按分隔符自然分片，每片不超过 CHUNK_SIZE 字符。"""
+def chunk_text(text: str, chunk_size: int = _DEFAULT_CHUNK_SIZE,
+               context_separators: list[str] | None = None) -> list[str]:
+    """按分隔符自然分片，每片不超过 chunk_size 字符。"""
     if not text:
         return []
-    if len(text) <= CHUNK_SIZE:
+    separators = context_separators if context_separators is not None else _DEFAULT_CONTEXT_SEPARATORS
+    if len(text) <= chunk_size:
         return [text]
 
     chunks = []
     remaining = text
 
-    while len(remaining) > CHUNK_SIZE:
+    while len(remaining) > chunk_size:
         split_pos = -1
-        for sep in CONTEXT_SEPARATORS:
-            pos = remaining.rfind(sep, 0, CHUNK_SIZE)
+        for sep in separators:
+            pos = remaining.rfind(sep, 0, chunk_size)
             if pos > 0:
                 split_pos = pos
                 break
@@ -79,8 +84,8 @@ def chunk_text(text: str) -> list[str]:
             chunks.append(remaining[:split_pos])
             remaining = remaining[split_pos:]
         else:
-            chunks.append(remaining[:CHUNK_SIZE])
-            remaining = remaining[CHUNK_SIZE:]
+            chunks.append(remaining[:chunk_size])
+            remaining = remaining[chunk_size:]
 
     if remaining:
         chunks.append(remaining)
@@ -108,6 +113,43 @@ class HumanTimelineStore:
 
     def __init__(self, db: VellumDB):
         self.db = db
+
+    # ── 配置读取 ────────────────────────────────────────────────
+
+    def _get_chunk_size(self) -> int:
+        """读取 chunk_size：环境变量 → config 表 → 默认 8000"""
+        env_val = os.environ.get("VELLUM_CHUNK_SIZE")
+        if env_val is not None:
+            return int(env_val)
+        try:
+            conn = self.db.connect()
+            row = conn.execute(
+                "SELECT value FROM config WHERE key = ?", ("chunk_size",)
+            ).fetchone()
+            if row:
+                return int(row["value"])
+        except Exception:
+            pass
+        return _DEFAULT_CHUNK_SIZE
+
+    def _get_context_separators(self) -> list[str]:
+        """读取 context_separators：环境变量 → config 表 → 默认"""
+        env_val = os.environ.get("VELLUM_CONTEXT_SEPARATORS")
+        if env_val is not None:
+            try:
+                return json.loads(env_val)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        try:
+            conn = self.db.connect()
+            row = conn.execute(
+                "SELECT value FROM config WHERE key = ?", ("context_separators",)
+            ).fetchone()
+            if row:
+                return json.loads(row["value"])
+        except Exception:
+            pass
+        return list(_DEFAULT_CONTEXT_SEPARATORS)
 
     # ── 写入 ──────────────────────────────────────────────────
 
@@ -191,7 +233,7 @@ class HumanTimelineStore:
 
     def _write_context_chunks(self, conn, text: str, timeline_id: str) -> list[str]:
         """分片并写入 conversation_context 表。"""
-        chunks = chunk_text(text)
+        chunks = chunk_text(text, self._get_chunk_size(), self._get_context_separators())
         ctx_ids = []
         for idx, chunk in enumerate(chunks):
             cid = _next_human_id()

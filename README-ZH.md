@@ -223,6 +223,8 @@ tests/
 | `VELLUM_DEDUP_THRESHOLD` | `0.9` | 去重扫描余弦相似度阈值 |
 | `VELLUM_DAEMON_INTERVAL` | `1800` | 守护线程扫描间隔（秒） |
 | `VELLUM_DEFAULT_TTL_DAYS` | `3` | time_sensitive 条目默认 TTL（天） |
+| `VELLUM_CHUNK_SIZE` | `1800` | context 分片字符上限 |
+| `VELLUM_CONTEXT_SEPARATORS` | `["\\n## ", "\\n```", "\\n\\n", "\\n", " "]` | context 分片自然分隔符。JSON 数组，例如 `["\\n## ", "\\n```", "\\n\\n", "\\n", " "]` |
 
 ## 许可证
 

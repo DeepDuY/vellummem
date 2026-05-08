@@ -235,6 +235,8 @@ tests/
 | `VELLUM_DEDUP_THRESHOLD` | `0.9` | Cosine similarity threshold for dedup |
 | `VELLUM_DAEMON_INTERVAL` | `1800` | Daemon loop interval in seconds |
 | `VELLUM_DEFAULT_TTL_DAYS` | `3` | Default TTL for time-sensitive entries |
+| `VELLUM_CHUNK_SIZE` | `1800` | Max characters per context chunk (when writing) |
+| `VELLUM_CONTEXT_SEPARATORS` | `["\\n## ", "\\n```", "\\n\\n", "\\n", " "]` | Natural delimiters for chunk splitting. JSON array of strings, e.g. `["\\n## ", "\\n```", "\\n\\n", "\\n", " "]` |
 
 ---
 

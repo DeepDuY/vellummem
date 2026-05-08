@@ -84,6 +84,8 @@ class VellumDB:
             ("dedup_enable",      "false",       "bool",  "启用后台去重扫描"),
             ("dedup_threshold",   "0.9",         "float", "去重扫描余弦相似度阈值"),
             ("daemon_interval",   "1800",        "int",   "守护线程扫描间隔（秒）"),
+            ("chunk_size",        "1800",        "int",   "context 分片字符上限（VELLUM_CHUNK_SIZE）"),
+            ("context_separators", '["\\n## ", "\\n### ", "\\n#### ", "\\n##### ", "\\n###### ", "\\n```", "\\n- ", "\\n* ", "\\n1. ", "\\n> ", "\\n\\n***\\n\\n", "\\n\\n---\\n\\n", "\\n\\n___\\n\\n", "\\n\\n", "\\n", " "]', "str", "context 分片自然分隔符 JSON 列表（VELLUM_CONTEXT_SEPARATORS）"),
         ]
         conn.executemany(
             "INSERT OR IGNORE INTO config (key, value, type, description) VALUES (?, ?, ?, ?)",

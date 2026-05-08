@@ -1,4 +1,4 @@
-# VellumMem — 设计文档 v8 (v1.3)
+# VellumMem — 设计文档 v8 (v1.4)
 
 > 状态：已实装 ✅
 > 内核：Human-only 纯记忆系统
