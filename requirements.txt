@@ -6,4 +6,4 @@ numpy>=1.24.0
 sentence-transformers>=3.0.0   # Transformer 向量引擎，自动检测
 
 # ── Dev ──────────────────────────────────────────────────────
-pytest>=8.0.0
+#pytest>=8.0.0
