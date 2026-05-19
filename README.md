@@ -36,7 +36,6 @@ VellumMem is an MCP server that gives AI assistants **persistent, searchable mem
 ```bash
 cd vellum
 pip install -r requirements.txt
-pip install sentence-transformers   # strongly recommended
 ```
 
 ### Run
