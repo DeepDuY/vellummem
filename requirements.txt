@@ -8,3 +8,4 @@ scikit-learn>=1.3.0          # LSI 向量引擎（兜底）
 
 # ── Dev ──────────────────────────────────────────────────────
 pytest>=8.0.0
+sentence-transformers 
